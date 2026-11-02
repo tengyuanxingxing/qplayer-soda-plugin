@@ -1,7 +1,6 @@
-> 本仓库是 [MiaM1ku/qplayer-soda-plugin](https://github.com/MiaM1ku/qplayer-soda-plugin) 的定制分支，保留原项目署名与许可证。配套 [QPlayer 定制版](https://github.com/tengyuanxingxing/qplayer/releases) 使用。
-> 从 QPlayer 1.9.11-custom 起，可在“设置 → 插件”内直接安装或更新此仓库的独立签名版本，保持原插件 ID 与账户存储。
-
 # QPlayer 汽水音乐音源插件
+
+定制维护版本 0.1.3（原项目：[TIMER-err/qplayer-soda-plugin](https://github.com/TIMER-err/qplayer-soda-plugin)）。关闭 frontier 通知模式，使用 HTTP 轮询；保留服务器原始二维码地址，新增轮询间隔、限流退避及确认进度提示。登录必须经过账号校验；已验证匿名出码和等待状态接口，未代替本人进行手机扫码确认。
 
 <p><b>简体中文</b> · <a href="README.en.md">English</a></p>
 
