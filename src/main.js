@@ -11,6 +11,8 @@ var SEARCH_BASE = "https://api.qishui.com/luna";
 var SEO_TRACK = "https://beta-luna.douyin.com/luna/h5/seo_track";
 var IMG_BASE = "https://p3-luna.douyinpic.com/img/";
 var AID = "386088";
+// A QR challenge and its polling must use the same device identity.
+var passportDeviceId = String(Date.now());
 
 function call(method, args) { return qplayer.call(method, args || {}); }
 
@@ -51,7 +53,9 @@ function cookieHeader(cookies) {
 }
 
 function loadCookies() {
-  return call("credentials.get", { key: "cookies" }).then(function (stored) {
+  return Promise.all([call("credentials.get", { key: "cookies" }), call("credentials.get", {key: "deviceId"})]).then(function (values) {
+    var stored = values[0];
+    if (/^\d+$/.test(String(values[1] || ""))) passportDeviceId = String(values[1]);
     if (!stored) return {};
     try { return JSON.parse(stored); } catch (_) { return {}; }
   }, function () { return {}; });
@@ -116,7 +120,7 @@ function androidSearchParams(extra) {
 }
 
 function pcParams(extra) {
-  var now = Date.now();
+  var now = Number(passportDeviceId);
   var params = {
     aid: AID, app_name: "luna_pc", region: "cn", geo_region: "cn", os_region: "cn",
     device_id: String(now), iid: String(now + 1), version_name: "3.3.0", version_code: "30030000",
@@ -558,8 +562,8 @@ function account() {
     if (!hasSession(cookies)) return { loggedIn: false };
     return getJson("https://api.qishui.com/luna/pc/me?" + pcParams(), { ua: UA_PC, headers: pcHeaders() })
       .then(function (body) {
-        var me = body.my_info || {};
-        var id = str(me.id);
+        var me = body.my_info || (body.data || {}).my_info || (body.data || {}).user || body.user || {};
+        var id = first(me.id, me.uid, me.user_id);
         if (!id) return { loggedIn: false };
         return {
           loggedIn: true, id: id,
@@ -567,7 +571,7 @@ function account() {
           avatarUrl: imageUrl(me.larger_avatar_url, "~c5_200x200.jpg"),
           membershipTier: 0, level: 0, signature: ""
         };
-      }, function () { return { loggedIn: true, id: "soda", displayName: "汽水用户", avatarUrl: "", membershipTier: 0, level: 0, signature: "" }; });
+      }, function () { throw new Error("汽水登录凭据已收到，但账号验证暂未成功，请重试或使用 Cookie 登录"); });
   });
 }
 
@@ -674,7 +678,7 @@ function utf8Hex(value) {
 }
 
 function passportLiteQuery() {
-  var now = String(Date.now());
+  var now = passportDeviceId;
   return formOf({
     passport_jssdk_version: "5.1.2",
     passport_jssdk_type: "lite",
@@ -802,12 +806,10 @@ function validateSodaSms(code) {
         if (!hasSession(finalCookies)) {
           return { methodId: "cookie", status: "failed", message: "验证通过，但未拿到登录 Cookie" };
         }
-        return call("credentials.put", { key: "cookies", value: JSON.stringify(finalCookies) })
-          .then(function () { return saveMfa({}); })
-          .then(function () { return account(); })
-          .then(function (profile) {
-            return { methodId: "cookie", status: "success", account: profile };
-          });
+        return completeSodaLogin(state.token || "", finalCookies, "cookie").then(function (challenge) {
+          if (challenge.status === "success") return saveMfa({}).then(function () { return challenge; });
+          return challenge;
+        });
       });
     });
   });
@@ -854,7 +856,7 @@ function handleSodaMfa(token, cookies, rawBody, parsed) {
 }
 
 function passportQuery() {
-  var now = String(Date.now());
+  var now = passportDeviceId;
   var params = [
     ["passport_jssdk_version", "2.4.13"],
     ["passport_jssdk_type", "normal"],
@@ -880,6 +882,36 @@ function passportQuery() {
   return params.map(function (pair) {
     return encodeURIComponent(pair[0]) + "=" + encodeURIComponent(pair[1]);
   }).join("&");
+}
+
+function completeSodaLogin(token, cookies, method) {
+  return Promise.all([call("credentials.put", {key: "cookies", value: JSON.stringify(cookies)}),
+    call("credentials.put", {key: "deviceId", value: passportDeviceId})])
+    .then(function () { return account(); }).then(function (profile) {
+      if (!profile || !profile.loggedIn) return {id: token, methodId: method, status: method === "qr" ? "scanned" : "failed", message: "已确认授权，账号校验尚未通过，请稍后重试"};
+      return {id: token, methodId: method, status: "success", account: profile};
+    }, function () {
+      return {id: token, methodId: method, status: method === "qr" ? "scanned" : "failed", message: "授权凭据已保存，账号暂未校验成功，请检查网络后重试"};
+    });
+}
+
+function followSodaLoginRedirect(url, cookies, depth) {
+  if (!url) return Promise.resolve(cookies);
+  if (depth >= 6) return Promise.reject(new Error("登录跳转次数过多，请重新扫码"));
+  if (!/^https:\/\/(?:[a-z0-9-]+\.)*(?:qishui\.com|douyin\.com|snssdk\.com)(?:[/:]|$)/i.test(url))
+    return Promise.reject(new Error("汽水返回了不支持的登录跳转地址"));
+  return call("http.request", {url: url, method: "GET", followRedirects: false,
+    headers: {"User-Agent": UA_PASSPORT, "Cookie": cookieHeader(cookies)}, timeoutMs: 20000}).then(function (response) {
+    var merged = mergeCookies(cookies, response.setCookies);
+    var headers = response.headers || {};
+    var next = headers.location || headers.Location || "";
+    if (next && Number(response.status) >= 300 && Number(response.status) < 400) {
+      if (next.charAt(0) === "/") next = /^https:\/\/[^/]+/.exec(url)[0] + next;
+      return followSodaLoginRedirect(next, merged, depth + 1);
+    }
+    if (Number(response.status) >= 400) throw new Error("汽水登录跳转失败，请重试");
+    return merged;
+  });
 }
 
 function login(args) {
@@ -909,7 +941,7 @@ function login(args) {
         if (!token) throw new Error(body.message || "未能获取登录二维码");
         var cookies = mergeCookies({}, response.setCookies);
         return call("crypto.digest", { algorithm: "MD5", data: token, dataEncoding: "utf8", outputEncoding: "hex" }).then(function (hex) {
-          return call("storage.put", { key: "qr" + hex, value: JSON.stringify(cookies) }).then(function () {
+          return call("storage.put", { key: "qr" + hex, value: JSON.stringify({cookies: cookies, deviceId: passportDeviceId}) }).then(function () {
             return {
               id: token, methodId: "qr", status: "waiting",
               qrContent: first(data.qrcode_index_url, data.web_url,
@@ -925,7 +957,12 @@ function login(args) {
       return call("crypto.digest", { algorithm: "MD5", data: token, dataEncoding: "utf8", outputEncoding: "hex" }).then(function (hex) {
       return call("storage.get", { key: "qr" + hex }).then(function (stored) {
         var pending = {};
-        try { pending = stored ? JSON.parse(stored) : {}; } catch (_) {}
+        try {
+          var state = stored ? JSON.parse(stored) : {};
+          pending = state.cookies || state;
+          if (state.deviceId) passportDeviceId = String(state.deviceId);
+        } catch (_) {}
+        if (hasSession(pending)) return completeSodaLogin(token, pending, "qr");
         var form = "need_logo=false&need_short_url=false&is_frontier=true&token="
           + encodeURIComponent(token) + "&is_new_login=1&next=" + encodeURIComponent("https://api.qishui.com");
         return call("http.request", {
@@ -940,12 +977,14 @@ function login(args) {
           timeoutMs: 20000
         }).then(function (response) {
           var cookies = mergeCookies(pending, response.setCookies);
+          var answer = {};
+          try { answer = JSON.parse(response.body || "{}"); } catch (_) {}
+          var redirect = findJsonString(answer, "redirect_url");
+          return followSodaLoginRedirect(redirect, cookies, 0).then(function (completed) {
+          cookies = completed;
           if (hasSession(cookies)) {
-            return call("credentials.put", { key: "cookies", value: JSON.stringify(cookies) })
-              .then(function () { return account(); })
-              .then(function (profile) {
-                return { id: token, methodId: "qr", status: "success", account: profile };
-              });
+            return call("storage.put", {key: "qr" + hex, value: JSON.stringify({cookies: cookies, deviceId: passportDeviceId})})
+              .then(function () { return completeSodaLogin(token, cookies, "qr"); });
           }
           var body = {};
           try { body = JSON.parse(response.body || "{}"); } catch (_) {}
@@ -957,13 +996,14 @@ function login(args) {
             return handleSodaMfa(token, cookies, response.body, body);
           }
           var status = String(data.status || "").toLowerCase();
-          if (status === "confirmed" || status === "scanned") {
-            return call("storage.put", { key: "qr" + hex, value: JSON.stringify(cookies) })
+          if (status === "confirmed" || status === "scanned" || status === "1" || status === "2") {
+            return call("storage.put", { key: "qr" + hex, value: JSON.stringify({cookies: cookies, deviceId: passportDeviceId}) })
               .then(function () { return { id: token, methodId: "qr", status: "scanned" }; });
           }
-          if (status === "expired") return { id: token, methodId: "qr", status: "expired" };
-          return { id: token, methodId: "qr", status: "waiting" };
-        }, function () { return { id: token, methodId: "qr", status: "waiting" }; });
+          if (status === "3" || status === "expired") return { id: token, methodId: "qr", status: "expired" };
+          return { id: token, methodId: "qr", status: "waiting", message: "等待扫码或确认授权" };
+          });
+        }, function () { return { id: token, methodId: "qr", status: "waiting", message: "网络暂未返回登录结果，正在重试" }; });
       });
       });
     }
@@ -974,11 +1014,7 @@ function login(args) {
       if (!hasSession(parsed)) {
         return { methodId: "cookie", status: "failed", message: "Cookie 中找不到 sessionid；若正在短信验证请只填验证码" };
       }
-      return call("credentials.put", { key: "cookies", value: JSON.stringify(parsed) })
-        .then(function () { return account(); })
-        .then(function (profile) {
-          return { methodId: "cookie", status: "success", account: profile };
-        });
+      return completeSodaLogin("", parsed, "cookie");
     }
     case "logout":
       return call("credentials.delete", { key: "cookies" }).then(function () { return true; }, function () { return true; });
